@@ -4,9 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python transcription of McCarthy's metacircular EVAL/APPLY evaluator, modified for **lexical** (not dynamic) scope using the FUNARG closure mechanism. The companion document `lexical-evaluator-conversation.md` explains the design decisions in depth — read it before changing the evaluator semantics.
+Two lexically-scoped variants of McCarthy's metacircular EVAL/APPLY evaluator, both using the FUNARG closure mechanism for **lexical** (not dynamic) scope:
+
+- **`lexlisp.py`** — a Python transcription with **no DEFINE**; every expression evaluates in the empty environment. Companion doc: `lexical-evaluator-conversation.md`.
+- **`lisp.js`** — Justine Tunney's "friendly" SectorLISP v2 (a C/JavaScript polyglot), converted to lexical scope **with a Scheme-style global frame** so top-level `DEFINE` keeps recursion-by-name working. Companion doc: `lisp-js-lexical-conversation.md`.
+
+Read the relevant companion document before changing evaluator semantics. The other markdown notes (`substitution-vs-environment.md`, `common-lisp-lexical-scope.md`) give background.
 
 ## Running
+
+### `lexlisp.py`
 
 ```bash
 python3 lexlisp.py
@@ -30,7 +37,25 @@ run("(QUOTE (A B C))")           # evaluates in empty env
 run("(CAR (QUOTE (A B C)))")     # => 'A'
 ```
 
-## Architecture
+### `lisp.js`
+
+The polyglot self-builds via its shell trampoline, or compile it directly (needs `bestline.c`/`bestline.h` fetched from justine.lol):
+
+```bash
+cc -w -xc lisp.js bestline.c -o lisp
+./lisp < lexical-tests.lisp
+```
+
+Without the C toolchain / network, `harness.cjs` drives the *real* `lisp.js` core under Node with a DOM-free REPL loop (verification only):
+
+```bash
+node harness.cjs                  # defaults to lexical-tests.lisp
+node harness.cjs some-other.lisp
+```
+
+`lexical-tests.lisp` is the smoke-test suite (bare self-application, Z combinator, a `DEFINE` recursion, and a free-variable case that now errors); expected outputs are in `lexical-tests.README.md`. The reader has **no comment syntax** and bare `T` is unbound, so test programs use `(QUOTE T)` and contain expressions only.
+
+## Architecture: `lexlisp.py`
 
 **Data model** (`lexlisp.py:21-26`): atoms are Python `str`, NIL is Python `None`, cons cells are 2-tuples. Closures are runtime-only cons cells tagged `FUNARG`: `(FUNARG params body . captured-env)` — they are never parsed from source.
 
@@ -43,3 +68,15 @@ run("(CAR (QUOTE (A B C)))")     # => 'A'
 **No DEFINE**: the evaluator has no top-level definition form. All expressions evaluate in the empty environment `NIL`. Recursion requires either explicit self-passing (`FF FF`) or the Z combinator; see `lexical-evaluator-conversation.md` §3.
 
 **Reader/writer** (`lexlisp.py:81-112`): minimal S-expression parser — tokenizes, then builds cons cells. Handles proper lists and NIL; dot notation is write-only (closures in output). `read` → `EVAL` → `write` is the round-trip.
+
+## Architecture: `lisp.js`
+
+A C/JavaScript polyglot: the C-only and JS-only sections are hidden from each other via comment/template-literal tricks, and a **shared core** (the `Eval`/`Apply`/`Assoc`/reader/GC functions near the top) is valid in both. **All evaluator edits live in the shared core** so both targets inherit them, and every edit must stay within the C/JS-common subset (`#define var int`, `#define function`, K&R-style defs) or the polyglot breaks. Run `node --check lisp.js` after edits.
+
+**Data model**: atoms are positive ints (interned), cons cells are negative ints, NIL is `0`. So in the core, `e > 0` ⇒ atom, `e < 0` ⇒ cons. A cons in operator position is assumed to be `(LAMBDA params body)` — `Apply` never checks the head atom — and a `(FUNARG params body . env)` closure aligns slot-for-slot, so body/param extraction is unchanged.
+
+**Lexical pivot** (mirrors `lexlisp.py`): `Eval` builds a `FUNARG` closure capturing `a` for `LAMBDA` and evaluates compound operators (atom operators stay raw so the builtins resolve by name); `Apply`'s closure branch binds params onto the captured tail `Cdr(Cdr(Cdr(f)))`, not the call-time `a`.
+
+**Global frame (the Scheme model)**: a shared global `g` holds top-level definitions. `Assoc` falls back to `g` (via `Lookup`) when the local env is exhausted; because `g` is consulted *live*, recursion-by-name plus forward/mutual references work without `LABEL`. Both driver loops (C `main`, JS `Lisp`) **evaluate** the `DEFINE` value into a closure and install it in `g`, and run top-level forms in the empty local env.
+
+**Deliberate behavior change vs upstream SectorLISP**: `DEFINE` now *evaluates* its value (Scheme `define` semantics) instead of storing the raw form. A literal atom must therefore be quoted — `(DEFINE FOO . (QUOTE BAR))`, not `(DEFINE FOO . BAR)`. `LAMBDA`/`FUNARG` are interned (in both builtin strings and `LoadBuiltins`), and the JS-only global `a` was renamed to the shared `g`.
